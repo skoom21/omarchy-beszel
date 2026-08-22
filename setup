@@ -25,8 +25,10 @@ command -v python3 >/dev/null 2>&1 || {
 bold "Omarchy Beszel widget — setup"
 echo
 
+# Read defaults only from a real file we own -- never through a symlink someone
+# else could have planted at this path.
 existing_url="" existing_email=""
-if [[ -r $CONFIG ]]; then
+if [[ -f $CONFIG && ! -L $CONFIG && -O $CONFIG && -r $CONFIG ]]; then
   warn "Existing config found at $CONFIG — press Enter to keep a value."
   existing_url=$(sed -n 's/^url=//p'   "$CONFIG" | head -1)
   existing_email=$(sed -n 's/^email=//p' "$CONFIG" | head -1)
@@ -59,49 +61,32 @@ read -r -s -p "Hub password: " password; echo
 [[ -n $password ]] || { err "password is required"; exit 1; }
 
 echo
-echo "Verifying…"
+echo "Verifying and saving…"
 # Secrets go over stdin, never argv and never the environment: /proc/<pid>/environ
 # and /proc/<pid>/cmdline are readable by any process running as this user.
 # printf is a bash builtin, so the password never becomes a process of its own;
 # only the non-secret url and email are passed as arguments.
+#
+# The helper both verifies and writes. Doing the write there rather than with
+# shell redirection matters: `mkdir -p`, `chmod`, and `>"$CONFIG"` all follow a
+# symlink standing in for the directory or the file, which would redirect this
+# password-bearing truncation somewhere else. The helper uses openat() against a
+# directory descriptor opened O_NOFOLLOW and checks ownership on the descriptors.
 if ! result=$(printf '%s' "$password" \
               | python3 -c '
 import json, sys
 print(json.dumps({"url": sys.argv[1], "email": sys.argv[2],
                   "password": sys.stdin.read()}))
 ' "$url" "$email" \
-              | BESZEL_CONFIG=/dev/null python3 "$HELPER" --check 2>&1); then
+              | BESZEL_CONFIG="$CONFIG" python3 "$HELPER" --write-config 2>&1); then
   err "  $result"
   echo
   err "Nothing was written. Check the URL and credentials and try again."
   echo "Note: this is a regular Beszel *user* account, not a PocketBase superuser."
   exit 1
 fi
-ok "  $result"
+ok "$result"
 
-mkdir -p "$(dirname "$CONFIG")"
-chmod 700 "$(dirname "$CONFIG")" 2>/dev/null
-
-# Preserve any label.* lines the user added by hand.
-labels=""
-[[ -r $CONFIG ]] && labels=$(grep '^label\.' "$CONFIG" 2>/dev/null)
-
-umask 077
-{
-  echo "# Credentials for the Omarchy Beszel widget. Keep this file private."
-  echo "url=$url"
-  echo "email=$email"
-  echo "password=$password"
-  echo
-  echo "# Optional: a subtitle shown under a server's name in the panel."
-  echo "# The key must match the system name as it appears in Beszel."
-  echo "# label.my-server=Hetzner · 10.0.0.1"
-  [[ -n $labels ]] && printf '%s\n' "$labels"
-} >"$CONFIG"
-chmod 600 "$CONFIG"
-
-echo
-ok "Wrote $CONFIG (0600)"
 echo
 bold "Next:"
 echo "  omarchy plugin enable skoom.beszel --section right"

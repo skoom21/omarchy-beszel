@@ -153,6 +153,75 @@ def read_config_file(path):
     return cfg
 
 
+def write_config(path, values):
+    """Write the credentials file without ever following a symlink.
+
+    Shell redirection cannot do this safely: `mkdir -p`, `chmod`, and `>file`
+    all follow a symlink standing in for the directory or the file, which would
+    redirect a password-bearing truncation somewhere else. Everything here goes
+    through openat() against a directory descriptor opened O_NOFOLLOW, with the
+    regular-file and ownership checks made on the descriptors themselves, so no
+    path is ever re-resolved between the check and the write.
+    """
+    parent = os.path.dirname(path) or "."
+    name = os.path.basename(path)
+    cloexec = getattr(os, "O_CLOEXEC", 0)
+
+    # Create the parent only when it is genuinely missing; never through a link.
+    try:
+        os.mkdir(parent, 0o700)
+    except FileExistsError:
+        pass
+
+    dfd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | cloexec)
+    try:
+        dst = os.fstat(dfd)
+        if not stat.S_ISDIR(dst.st_mode):
+            raise PermissionError(f"not a directory: {parent}")
+        if dst.st_uid != os.getuid():
+            raise PermissionError(f"not owned by this user: {parent}")
+        os.fchmod(dfd, 0o700)
+
+        # Keep any label.* lines the user added by hand.
+        labels = []
+        try:
+            rfd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | cloexec, dir_fd=dfd)
+            with os.fdopen(rfd, "r", errors="replace") as fh:
+                for line in fh.read(MAX_FILE_BYTES).splitlines():
+                    if line.strip().startswith("label."):
+                        labels.append(line.rstrip())
+        except OSError:
+            pass
+
+        fd = os.open(name,
+                     os.O_CREAT | os.O_WRONLY | os.O_TRUNC | os.O_NOFOLLOW | cloexec,
+                     0o600, dir_fd=dfd)
+        try:
+            fst = os.fstat(fd)
+            if not stat.S_ISREG(fst.st_mode):
+                raise PermissionError(f"not a regular file: {path}")
+            if fst.st_uid != os.getuid():
+                raise PermissionError(f"not owned by this user: {path}")
+            os.fchmod(fd, 0o600)
+            body = [
+                "# Credentials for the Omarchy Beszel widget. Keep this file private.",
+                f"url={values.get('url', '')}",
+                f"email={values.get('email', '')}",
+                f"password={values.get('password', '')}",
+                "",
+                "# Optional: a subtitle shown under a server's name in the panel.",
+                "# The key must match the system name as it appears in Beszel.",
+                "# label.my-server=Hetzner \u00b7 10.0.0.1",
+            ] + labels
+            with os.fdopen(fd, "w") as fh:
+                fh.write("\n".join(body) + "\n")
+        except Exception:
+            os.close(fd)
+            raise
+    finally:
+        os.close(dfd)
+
+
 def read_stdin_secrets():
     """Secrets handed over on stdin by the panel, one JSON object per run.
 
@@ -252,15 +321,22 @@ def authenticate(cfg):
     return token
 
 
-def fetch(cfg):
-    """Try the cached token first; re-authenticate once if it has expired."""
+def fetch(cfg, force_auth=False):
+    """Try the cached token first; re-authenticate once if it has expired.
+
+    force_auth skips the cache entirely. --check and --write-config must
+    actually exercise the password: the cache is keyed on url+email, so a stale
+    entry would otherwise let a wrong password report success and be saved,
+    only to fail confusingly once the token expired.
+    """
     token = None
-    try:
-        fd = _open_private(cache_path(cfg), os.O_RDONLY)
-        with os.fdopen(fd, "r", errors="replace") as fh:
-            token = fh.read(MAX_FILE_BYTES).strip()
-    except OSError:
-        pass
+    if not force_auth:
+        try:
+            fd = _open_private(cache_path(cfg), os.O_RDONLY)
+            with os.fdopen(fd, "r", errors="replace") as fh:
+                token = fh.read(MAX_FILE_BYTES).strip()
+        except OSError:
+            pass
 
     for attempt in (0, 1):
         if not token:
@@ -331,8 +407,8 @@ def base_payload(cfg, **extra):
 
 # ----------------------------------------------------------------------- main
 
-def build(cfg):
-    systems, alerts = fetch(cfg)
+def build(cfg, force_auth=False):
+    systems, alerts = fetch(cfg, force_auth=force_auth)
 
     total = len(systems)
     up = sum(1 for s in systems if s.get("status") == "up")
@@ -388,13 +464,15 @@ def build(cfg):
 
 
 def main():
-    check = "--check" in sys.argv[1:]
+    args = sys.argv[1:]
+    check = "--check" in args
+    write = "--write-config" in args
     cfg = resolve_config()
 
     missing = missing_fields(cfg)
     if missing:
         message = "Not configured — missing " + ", ".join(missing)
-        if check:
+        if check or write:
             print(message, file=sys.stderr)
             return 1
         emit(base_payload(cfg, label="setup", badge="Setup needed",
@@ -402,16 +480,27 @@ def main():
         return 0
 
     try:
-        payload = build(cfg)
+        payload = build(cfg, force_auth=(check or write))
     except Exception as e:  # noqa: BLE001 - any failure must still render
         message = friendly_error(e)
-        if check:
+        if check or write:
             print(message, file=sys.stderr)
             return 1
         badge = ("Auth failed" if "credentials" in message
                  else "Unreachable" if "reach" in message else "Error")
         emit(base_payload(cfg, configured=True, label="!", badge=badge,
                           summary=message, error=message))
+        return 0
+
+    if write:
+        # Only persist credentials the hub has just accepted.
+        try:
+            write_config(cfg["_configPath"], cfg)
+        except OSError as e:
+            print(f"Refusing to write {cfg['_configPath']}: {e}", file=sys.stderr)
+            return 1
+        print(f"Connected to {cfg['url']} — {payload['up']}/{payload['total']} up")
+        print(f"Wrote {cfg['_configPath']} (0600)")
         return 0
 
     if check:
