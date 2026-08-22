@@ -24,7 +24,7 @@ Prefer to stay in the GUI? Skip `setup` and fill in **Hub URL**, **Hub email**,
 and **Hub password** under *Setup › Plugins › Beszel servers* instead. Until
 one of the two is done, the panel tells you exactly what to do:
 
-![The setup card](screenshots/setup.png)
+![The first-run card](screenshots/first-run.png)
 
 **Requirements:** Omarchy with the Quickshell bar, `python3` (stdlib only), and
 a reachable Beszel hub. Use a regular Beszel **user** account — not a
