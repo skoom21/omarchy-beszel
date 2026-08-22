@@ -30,6 +30,25 @@ one of the two is done, the panel tells you exactly what to do:
 a reachable Beszel hub. Use a regular Beszel **user** account — not a
 PocketBase superuser, which the API treats differently.
 
+## Removal
+
+```bash
+omarchy plugin remove skoom.beszel
+```
+
+That unloads the widget and takes it out of your bar layout. It leaves nothing
+of yours behind except the two files it created, which you can delete if you
+are not reinstalling:
+
+```bash
+rm -rf ~/.config/beszel-status    # hub credentials
+rm -rf ~/.cache/omarchy-beszel    # cached session token
+```
+
+The plugin never writes to `shell.json` itself — only `omarchy plugin
+enable`/`disable` and `omarchy bar` do, and `omarchy plugin remove` reverses
+that. Nothing else on your system is touched.
+
 ## What you get
 
 | | |
