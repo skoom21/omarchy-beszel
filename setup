@@ -45,6 +45,15 @@ else
 fi
 [[ -n $email ]] || { err "email is required"; exit 1; }
 
+# Plain HTTP to anything but the loopback sends these credentials, and every
+# later API call, in the clear. Worth saying out loud before they are typed.
+if [[ $url == http://* ]] && ! [[ $url =~ ^http://(localhost|127\.0\.0\.1|\[::1\])(:|/|$) ]]; then
+  warn "This is a plain-HTTP URL to a remote host. Your password and every"
+  warn "subsequent request will cross the network unencrypted. Prefer https://,"
+  warn "or reach the hub over an SSH tunnel and point this at localhost."
+  echo
+fi
+
 # -s so the password is never echoed to the terminal or its scrollback.
 read -r -s -p "Hub password: " password; echo
 [[ -n $password ]] || { err "password is required"; exit 1; }

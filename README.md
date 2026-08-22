@@ -119,6 +119,48 @@ themes make it the *darker* of the two. So the helper reads `red`,
 background, and returns whichever actually reads. It re-checks every poll, so
 the colour follows theme changes without a restart.
 
+## Security
+
+Plugins run as unsandboxed code inside your long-lived `omarchy-shell`
+process, so this one is written defensively.
+
+**Credentials.** They reach the helper through the environment, never argv, so
+they never appear in `ps`. `setup` writes the file `0600` inside a `0700`
+directory and reads the password with `read -s`, so it stays out of your shell
+history and scrollback. The cached session token is written `0600` in a `0700`
+directory, with an explicit `chmod` — `O_CREAT` does not tighten a file that
+already exists. The password is never included in the helper's JSON output.
+
+**The hub is treated as untrusted.** A hub you do not control — or one that has
+been compromised — is a hostile input source, and the plugin is built to assume
+that:
+
+- *Redirects are refused.* `urllib` replays the `Authorization` header across a
+  cross-origin redirect, so a hub could otherwise bounce an authenticated
+  request to a host it controls and harvest the session token. The Beszel API
+  has no legitimate use for a redirect, so one is an error.
+- *Hub strings are never markup.* QML `Text` defaults to `Text.AutoText`, which
+  auto-detects and renders HTML — a server named
+  `<img src="http://attacker/beacon.png">` would make the shell issue an
+  outbound request. Every `Text` element pins `textFormat: Text.PlainText`.
+- *Responses are capped* at 4 MB, so a hostile hub cannot exhaust memory.
+
+**No shell interpolation.** Omarchy's `bar.run()` passes its argument to
+`bash -lc`. This plugin never uses it. The dashboard launches through
+`Quickshell.execDetached`'s argv form, and only for a string matching an
+http(s) allowlist, so neither a crafted `hubUrl` nor a `file://` or
+`javascript:` URL can turn a right-click into command execution.
+
+**Transport.** A `https://` hub is encrypted and its certificate is verified.
+A plain `http://` hub to anything but loopback sends your password and every
+later request in the clear; `setup` warns when you enter one. Prefer `https://`,
+or reach a remote hub over an SSH tunnel and point the plugin at `localhost`.
+
+**Storing the password in plugin settings** puts it in `~/.config/omarchy/shell.json`
+in plain text, readable by anything running as you and easy to commit to a
+dotfiles repo by accident. The settings field is labelled accordingly. Use
+`setup` unless you have a reason not to.
+
 ## Note for anyone editing this
 
 Do not name a property `data` on the root. `data` is `Item`'s default property
