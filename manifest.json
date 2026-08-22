@@ -18,7 +18,10 @@
     "displayName": "Beszel servers",
     "description": "Up-count in the bar; click for per-server meters, load, uptime, and firing alerts.",
     "category": "System",
-    "aliases": ["beszel", "servers"],
+    "aliases": [
+      "beszel",
+      "servers"
+    ],
     "allowMultiple": false,
     "defaultSection": "right",
     "defaults": {
@@ -27,9 +30,21 @@
       "password": "",
       "credentialsFile": "",
       "refreshIntervalSec": 30,
-      "openRefreshIntervalSec": 5
+      "openRefreshIntervalSec": 5,
+      "maskSensitive": "On"
     },
     "schema": [
+      {
+        "key": "maskSensitive",
+        "type": "enum",
+        "label": "Hide sensitive details",
+        "options": [
+          "On",
+          "Off"
+        ],
+        "defaultValue": "On",
+        "description": "Masks server names, addresses, and the hub URL behind an eye toggle so a screenshot or screen share does not expose your infrastructure. Revealing is per-viewing: the panel re-hides when it closes."
+      },
       {
         "key": "hubUrl",
         "type": "string",

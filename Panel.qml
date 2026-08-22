@@ -37,6 +37,33 @@ Panel {
   readonly property string pluginDir: String(Qt.resolvedUrl(".")).replace(/^file:\/\//, "").replace(/\/$/, "")
   readonly property string helperPath: root.pluginDir + "/bin/beszel-status"
 
+  // Sensitive details are hidden by default so a screenshot, a screen share, or
+  // a glance over your shoulder does not expose your infrastructure. The eye in
+  // the hero reveals them for this viewing only -- closing the panel re-hides.
+  readonly property bool maskByDefault: String(setting("maskSensitive", "On")) !== "Off"
+  property bool revealed: false
+  readonly property bool hidden: root.maskByDefault && !root.revealed
+
+  // Server names identify projects and labels carry provider and IP, so both
+  // are withheld. The position is kept -- "Server 2" still tells you which row
+  // you are reading -- and the metrics themselves reveal nothing.
+  function serverName(server, index) {
+    if (!root.hidden) return server ? String(server.name) : ""
+    return "Server " + (index + 1)
+  }
+
+  function maskValue(value) {
+    return root.hidden ? "••••••••" : String(value || "")
+  }
+
+  // Shown paths use ~ rather than the real home directory: it is shorter, it
+  // pastes into any shell, and it keeps the username out of screenshots.
+  function tildePath(path) {
+    var home = String(Quickshell.env("HOME") || "")
+    var p = String(path || "")
+    return (home !== "" && p.indexOf(home) === 0) ? "~" + p.substring(home.length) : p
+  }
+
   readonly property bool configured: root.payload.configured === true
   readonly property bool problem: !root.payload.ok
   readonly property string errorText: String(root.payload.error || "")
@@ -118,7 +145,11 @@ Panel {
     onTriggered: root.refreshNow()
   }
 
-  onOpenedChanged: if (opened) refreshNow()
+  onOpenedChanged: {
+    if (opened) refreshNow()
+    // Re-arm the mask on close so the next viewing always starts hidden.
+    else root.revealed = false
+  }
 
   IpcHandler {
     target: "skoom.beszel"
@@ -201,6 +232,41 @@ Panel {
             foreground: root.problem ? root.alertColor : root.foreground
             fontFamily: root.fontFamily
 
+            // Eye toggle, pinned to the hero's trailing edge by PanelHero.
+            // Only meaningful when masking is switched on in settings.
+            trailingControl: Component {
+              Item {
+                implicitWidth: Style.space(26)
+                implicitHeight: Style.space(26)
+                visible: root.maskByDefault
+
+                Text {
+                  anchors.centerIn: parent
+                  textFormat: Text.PlainText
+                  // nf-fa-eye / nf-fa-eye-slash
+                  text: root.revealed ? "\uf06e" : "\uf070"
+                  color: root.revealed ? root.foreground : root.dim
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.body
+                }
+
+                MouseArea {
+                  id: eyeArea
+                  anchors.fill: parent
+                  hoverEnabled: true
+                  cursorShape: Qt.PointingHandCursor
+                  onClicked: root.revealed = !root.revealed
+
+                  PanelToolTip {
+                    visible: eyeArea.containsMouse
+                    text: root.revealed ? "Hide sensitive details"
+                                        : "Reveal sensitive details"
+                    fontFamily: root.fontFamily
+                  }
+                }
+              }
+            }
+
             iconComponent: Component {
               Text {
                 textFormat: Text.PlainText
@@ -252,7 +318,7 @@ Panel {
                 id: cmd
                 anchors.centerIn: parent
                 width: parent.width - Style.space(16)
-                text: root.pluginDir + "/setup"
+                text: root.tildePath(root.pluginDir) + "/setup"
                 color: root.foreground
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.caption
@@ -297,7 +363,7 @@ Panel {
               textFormat: Text.PlainText
               width: parent.width
               visible: root.hubUrl !== ""
-              text: "Hub: " + root.hubUrl
+              text: "Hub: " + root.maskValue(root.hubUrl)
               color: root.dim
               font.family: root.fontFamily
               font.pixelSize: Style.font.caption
@@ -322,6 +388,7 @@ Panel {
               ServerCard {
                 width: column.width
                 server: modelData
+                position: index
               }
             }
           }
@@ -349,7 +416,8 @@ Panel {
               Text {
                 textFormat: Text.PlainText
                 width: column.width
-                text: "\uf071  " + modelData.system + " — " + (modelData.types || []).join(", ")
+                text: "\uf071  " + (root.hidden ? "Server" : modelData.system)
+                    + " — " + (modelData.types || []).join(", ")
                 color: root.alertColor
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.caption
@@ -382,6 +450,7 @@ Panel {
   component ServerCard: Column {
     id: card
     property var server: null
+    property int position: 0
     readonly property bool down: !card.server || card.server.status !== "up"
 
     spacing: Style.space(6)
@@ -393,7 +462,7 @@ Panel {
       Text {
         textFormat: Text.PlainText
         id: nameText
-        text: card.server ? card.server.name : ""
+        text: root.serverName(card.server, card.position)
         color: root.foreground
         font.family: root.fontFamily
         font.pixelSize: Style.font.body
@@ -421,7 +490,7 @@ Panel {
     Text {
       textFormat: Text.PlainText
       width: parent.width
-      visible: !!card.server && String(card.server.label) !== ""
+      visible: !root.hidden && !!card.server && String(card.server.label) !== ""
       text: card.server ? card.server.label : ""
       color: root.dim
       font.family: root.fontFamily
