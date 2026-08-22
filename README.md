@@ -6,6 +6,8 @@ panel with per-server CPU, memory, and disk meters.
 
 ![The panel, healthy](screenshots/panel.png)
 
+Sensitive details are hidden by default — click the eye to reveal them.
+
 ## Install
 
 ```bash
@@ -45,6 +47,7 @@ freezing its last reading as though it were current.
 | Left click | Toggle the panel |
 | Right click | Open the Beszel dashboard |
 | Middle click | Force a refresh |
+| Eye (in the panel) | Reveal sensitive details for this viewing |
 | `r` | Refresh (panel focused) |
 | Arrows | Scroll |
 | `Esc` | Close |
@@ -56,6 +59,7 @@ freezing its last reading as though it were current.
 
 | Key | Default | Meaning |
 |---|---|---|
+| `maskSensitive` | `On` | Hide server names, addresses, and hub URL behind the eye |
 | `hubUrl` | — | e.g. `http://localhost:8090` |
 | `email` | — | Beszel user account |
 | `password` | — | Plain text in `shell.json` — prefer `setup` |
@@ -130,6 +134,19 @@ directory and reads the password with `read -s`, so it stays out of your shell
 history and scrollback. The cached session token is written `0600` in a `0700`
 directory, with an explicit `chmod` — `O_CREAT` does not tighten a file that
 already exists. The password is never included in the helper's JSON output.
+
+**Sensitive details are hidden by default.** Server names identify projects and
+the label line carries provider and IP, so the panel withholds both — along
+with the hub URL, and the username in the setup path — until you click the eye
+in the hero. Masked rows keep their position (`Server 2`), so the panel stays
+readable at a glance; the metrics themselves reveal nothing. Revealing lasts
+only for that viewing: closing the panel re-arms the mask, so it cannot be left
+off by accident before a screen share. Set **Hide sensitive details** to `Off`
+to opt out, or bind the toggle:
+
+```bash
+omarchy-shell skoom.beszel toggleReveal
+```
 
 **The hub is treated as untrusted.** A hub you do not control — or one that has
 been compromised — is a hostile input source, and the plugin is built to assume
