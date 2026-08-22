@@ -157,6 +157,13 @@ Panel {
     function close(): void { root.close() }
     function toggle(): void { root.toggle() }
     function refresh(): string { root.refreshNow(); return "ok" }
+    // Exposed so the reveal can be bound to a key or driven from a script.
+    function reveal(): string { root.revealed = true; return "revealed" }
+    function hide(): string { root.revealed = false; return "hidden" }
+    function toggleReveal(): string {
+      root.revealed = !root.revealed
+      return root.revealed ? "revealed" : "hidden"
+    }
   }
 
   BarIconButton {
