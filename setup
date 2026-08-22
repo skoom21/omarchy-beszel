@@ -60,9 +60,17 @@ read -r -s -p "Hub password: " password; echo
 
 echo
 echo "Verifying…"
-# Pass secrets through the environment, never argv, so they stay out of `ps`.
-if ! result=$(BESZEL_URL="$url" BESZEL_EMAIL="$email" BESZEL_PASSWORD="$password" \
-              BESZEL_CONFIG=/dev/null python3 "$HELPER" --check 2>&1); then
+# Secrets go over stdin, never argv and never the environment: /proc/<pid>/environ
+# and /proc/<pid>/cmdline are readable by any process running as this user.
+# printf is a bash builtin, so the password never becomes a process of its own;
+# only the non-secret url and email are passed as arguments.
+if ! result=$(printf '%s' "$password" \
+              | python3 -c '
+import json, sys
+print(json.dumps({"url": sys.argv[1], "email": sys.argv[2],
+                  "password": sys.stdin.read()}))
+' "$url" "$email" \
+              | BESZEL_CONFIG=/dev/null python3 "$HELPER" --check 2>&1); then
   err "  $result"
   echo
   err "Nothing was written. Check the URL and credentials and try again."

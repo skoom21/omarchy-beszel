@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
 """Emit a one-line JSON summary of a Beszel hub for the Omarchy bar widget.
 
-Configuration is resolved per key, environment first, then the credentials
-file, so a user can put the hub URL in the plugin settings while keeping the
-password out of shell.json:
+Configuration is resolved per key: the credentials file is the base, then
+non-secret values from the environment, then secrets from stdin. So a user can
+put the hub URL in plugin settings while keeping the password out of
+shell.json.
 
-  BESZEL_URL / BESZEL_EMAIL / BESZEL_PASSWORD   passed by the panel
+  stdin                one JSON object: {"url","email","password"} -- secrets
+                       travel here because /proc/<pid>/environ is readable by
+                       any same-user process for the lifetime of this one
+  BESZEL_URL / BESZEL_EMAIL         non-secret, environment is fine
   $BESZEL_CONFIG or ~/.config/beszel-status/config   key=value, mode 0600
 
 Always exits 0 and always prints valid JSON, so the bar never has to parse
@@ -16,6 +20,8 @@ Stdlib only, so it runs anywhere Omarchy does.
 import hashlib
 import json
 import os
+import select
+import stat
 import sys
 import urllib.error
 import urllib.request
@@ -28,6 +34,8 @@ CACHE_DIR = os.path.join(
     "omarchy-beszel")
 TIMEOUT = 5
 MAX_BYTES = 4 * 1024 * 1024
+MAX_FILE_BYTES = 256 * 1024
+STDIN_WAIT = 2.0
 FALLBACK_RED = "#de6145"
 
 
@@ -103,33 +111,95 @@ def alert_color():
 
 # -------------------------------------------------------------- configuration
 
+def _open_private(path, flags, mode=0o600):
+    """Open a path we expect to own, refusing symlinks and foreign files.
+
+    O_NOFOLLOW stops a symlink planted at a predictable path from redirecting a
+    read or a token write somewhere else, and the fstat check refuses anything
+    that is not a regular file we own -- both verified after the fd exists, so
+    there is no TOCTOU gap between the check and the use.
+    """
+    fd = os.open(path, flags | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0), mode)
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise PermissionError(f"not a regular file: {path}")
+        if st.st_uid != os.getuid():
+            raise PermissionError(f"not owned by this user: {path}")
+    except Exception:
+        os.close(fd)
+        raise
+    return fd
+
+
 def read_config_file(path):
+    """Parse a key=value credentials file, bounded and symlink-safe."""
     cfg = {}
     try:
-        with open(path) as fh:
-            for line in fh:
-                line = line.strip()
-                if line and not line.startswith("#") and "=" in line:
-                    k, v = line.split("=", 1)
-                    cfg[k.strip()] = v.strip()
+        fd = _open_private(path, os.O_RDONLY)
+    except OSError:
+        return cfg
+    try:
+        with os.fdopen(fd, "r", errors="replace") as fh:
+            # Read a bounded prefix so an oversized file is never materialized.
+            blob = fh.read(MAX_FILE_BYTES)
+        for line in blob.splitlines():
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                k, v = line.split("=", 1)
+                cfg[k.strip()] = v.strip()
     except OSError:
         pass
     return cfg
 
 
+def read_stdin_secrets():
+    """Secrets handed over on stdin by the panel, one JSON object per run.
+
+    The environment is not a safe channel: /proc/<pid>/environ is readable by
+    any process running as the same user for as long as this one lives. stdin
+    is private to the pipe. A short select() guard keeps a run that is given no
+    input -- a shell invocation, say -- from blocking forever.
+    """
+    try:
+        if sys.stdin is None or sys.stdin.closed or sys.stdin.isatty():
+            return {}
+        if not select.select([sys.stdin], [], [], STDIN_WAIT)[0]:
+            return {}
+        raw = sys.stdin.readline(MAX_FILE_BYTES).strip()
+    except (OSError, ValueError):
+        return {}
+    if not raw:
+        return {}
+    try:
+        payload = json.loads(raw)
+    except ValueError:
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    return {k: str(v) for k, v in payload.items()
+            if k in ("url", "email", "password") and v}
+
+
 def resolve_config():
-    path = os.environ.get("BESZEL_CONFIG") or DEFAULT_CONFIG
-    cfg = read_config_file(os.path.expanduser(path))
-    # Plugin settings win per key, so the URL can live in shell.json while the
-    # password stays in the 0600 file.
-    for env_key, cfg_key in (("BESZEL_URL", "url"),
-                             ("BESZEL_EMAIL", "email"),
-                             ("BESZEL_PASSWORD", "password")):
+    """Merge config sources, most trusted last.
+
+    The credentials file is the base. Non-secret values may come from the
+    environment. Secrets arrive only on stdin or from the file -- never the
+    environment, which is world-readable to same-user processes.
+    """
+    path = os.path.expanduser(os.environ.get("BESZEL_CONFIG") or DEFAULT_CONFIG)
+    cfg = read_config_file(path)
+
+    for env_key, cfg_key in (("BESZEL_URL", "url"), ("BESZEL_EMAIL", "email")):
         value = os.environ.get(env_key, "").strip()
         if value:
             cfg[cfg_key] = value
+
+    cfg.update(read_stdin_secrets())
+
     cfg.setdefault("url", "http://localhost:8090")
-    cfg["_configPath"] = os.path.expanduser(path)
+    cfg["_configPath"] = path
     return cfg
 
 
@@ -170,10 +240,12 @@ def authenticate(cfg):
         os.makedirs(CACHE_DIR, mode=0o700, exist_ok=True)
         os.chmod(CACHE_DIR, 0o700)
         path = cache_path(cfg)
-        fd = os.open(path, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
-        with open(fd, "w") as fh:
+        # O_NOFOLLOW: the cache path is predictable, so a symlink planted there
+        # must not be able to redirect the session-token write.
+        fd = _open_private(path, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as fh:
             fh.write(token)
-        # O_CREAT does not tighten an existing file, so set it explicitly.
+        # O_CREAT does not tighten a file that already exists.
         os.chmod(path, 0o600)
     except OSError:
         pass  # A cache we cannot write just means re-authenticating each poll.
@@ -184,8 +256,9 @@ def fetch(cfg):
     """Try the cached token first; re-authenticate once if it has expired."""
     token = None
     try:
-        with open(cache_path(cfg)) as fh:
-            token = fh.read().strip()
+        fd = _open_private(cache_path(cfg), os.O_RDONLY)
+        with os.fdopen(fd, "r", errors="replace") as fh:
+            token = fh.read(MAX_FILE_BYTES).strip()
     except OSError:
         pass
 

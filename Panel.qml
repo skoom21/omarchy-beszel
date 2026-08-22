@@ -107,16 +107,23 @@ Panel {
     // Invoked through python3 rather than relying on the executable bit, so a
     // checkout with lost file modes still works.
     command: ["python3", root.helperPath]
-    // Secrets go through the environment, never argv, so they never appear in
-    // `ps`. Empty values are ignored by the helper, which then falls back to
-    // the credentials file -- that is what makes "URL here, password in the
-    // file" work.
+    // Only the non-secret config path goes through the environment.
     environment: ({
-      "BESZEL_URL": String(root.setting("hubUrl", "")),
-      "BESZEL_EMAIL": String(root.setting("email", "")),
-      "BESZEL_PASSWORD": String(root.setting("password", "")),
       "BESZEL_CONFIG": String(root.setting("credentialsFile", ""))
     })
+    // Secrets go over stdin, never argv and never the environment:
+    // /proc/<pid>/environ is readable by any process running as this user for
+    // as long as the helper lives, whereas the pipe is private to it. An
+    // object is written on every run -- empty when the credentials file is in
+    // use -- so the helper never waits on input that is not coming.
+    stdinEnabled: true
+    onStarted: {
+      write(JSON.stringify({
+        url: String(root.setting("hubUrl", "")),
+        email: String(root.setting("email", "")),
+        password: String(root.setting("password", ""))
+      }) + "\n")
+    }
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
