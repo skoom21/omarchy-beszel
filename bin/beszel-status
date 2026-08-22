@@ -27,7 +27,24 @@ CACHE_DIR = os.path.join(
     os.environ.get("XDG_CACHE_HOME", os.path.expanduser("~/.cache")),
     "omarchy-beszel")
 TIMEOUT = 5
+MAX_BYTES = 4 * 1024 * 1024
 FALLBACK_RED = "#de6145"
+
+
+class _NoRedirects(urllib.request.HTTPRedirectHandler):
+    """Refuse every redirect.
+
+    urllib replays the Authorization header on a cross-origin redirect, so a
+    hostile or compromised hub could bounce an authenticated request to a host
+    it controls and harvest the session token. A Beszel API endpoint has no
+    legitimate reason to redirect, so treat one as an error.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise urllib.error.URLError(f"refused redirect to {newurl}")
+
+
+_OPENER = urllib.request.build_opener(_NoRedirects)
 
 
 # --------------------------------------------------------------- theme colour
@@ -138,8 +155,11 @@ def call(base, path, token=None, data=None):
         data=json.dumps(data).encode() if data else None,
         method="POST" if data else "GET",
     )
-    with urllib.request.urlopen(req, timeout=TIMEOUT) as r:
-        return json.load(r)
+    with _OPENER.open(req, timeout=TIMEOUT) as r:
+        raw = r.read(MAX_BYTES + 1)
+    if len(raw) > MAX_BYTES:
+        raise ValueError("hub response too large")
+    return json.loads(raw)
 
 
 def authenticate(cfg):
@@ -147,10 +167,14 @@ def authenticate(cfg):
                data={"identity": cfg["email"], "password": cfg["password"]})
     token = res["token"]
     try:
-        os.makedirs(CACHE_DIR, exist_ok=True)
-        fd = os.open(cache_path(cfg), os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
+        os.makedirs(CACHE_DIR, mode=0o700, exist_ok=True)
+        os.chmod(CACHE_DIR, 0o700)
+        path = cache_path(cfg)
+        fd = os.open(path, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
         with open(fd, "w") as fh:
             fh.write(token)
+        # O_CREAT does not tighten an existing file, so set it explicitly.
+        os.chmod(path, 0o600)
     except OSError:
         pass  # A cache we cannot write just means re-authenticating each poll.
     return token
@@ -209,6 +233,8 @@ def friendly_error(e):
         return f"Hub returned HTTP {e.code}"
     if isinstance(e, urllib.error.URLError):
         return f"Cannot reach hub ({e.reason})"
+    if isinstance(e, (KeyError, ValueError, TypeError)):
+        return "Hub returned an unexpected response"
     return str(e) or e.__class__.__name__
 
 

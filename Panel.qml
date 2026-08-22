@@ -62,9 +62,17 @@ Panel {
     return root.foreground
   }
 
+  // bar.run() hands its argument to `bash -lc`, so concatenating a
+  // config-supplied URL into it is a shell-injection sink: a hubUrl of
+  // "http://x; rm -rf ~" would execute on right-click. Launch through
+  // execDetached's argv form, which never involves a shell, and only for a
+  // string that actually looks like an http(s) URL.
+  readonly property var safeUrlRe: /^https?:\/\/[^\s"'`;|&$<>()\\]+$/
+
   function openDashboard() {
-    if (root.bar && root.hubUrl !== "")
-      root.bar.run("omarchy-launch-webapp " + root.hubUrl)
+    var url = String(root.hubUrl || "")
+    if (!root.safeUrlRe.test(url)) return
+    Quickshell.execDetached(["omarchy-launch-webapp", url])
   }
 
   Process {
@@ -195,6 +203,7 @@ Panel {
 
             iconComponent: Component {
               Text {
+                textFormat: Text.PlainText
                 text: "\uf233"
                 color: root.problem ? root.alertColor : root.foreground
                 font.family: root.fontFamily
@@ -220,6 +229,7 @@ Panel {
             }
 
             Text {
+              textFormat: Text.PlainText
               width: parent.width
               text: "Point this widget at your Beszel hub. Either fill in Hub URL, "
                   + "email, and password under Setup › Plugins › Beszel servers, "
@@ -238,6 +248,7 @@ Panel {
               color: root.track
 
               Text {
+                textFormat: Text.PlainText
                 id: cmd
                 anchors.centerIn: parent
                 width: parent.width - Style.space(16)
@@ -250,6 +261,7 @@ Panel {
             }
 
             Text {
+              textFormat: Text.PlainText
               width: parent.width
               text: "Needs a regular Beszel user account — not a PocketBase superuser."
               color: root.dim
@@ -272,6 +284,7 @@ Panel {
             }
 
             Text {
+              textFormat: Text.PlainText
               width: parent.width
               text: root.errorText
               color: root.alertColor
@@ -281,6 +294,7 @@ Panel {
             }
 
             Text {
+              textFormat: Text.PlainText
               width: parent.width
               visible: root.hubUrl !== ""
               text: "Hub: " + root.hubUrl
@@ -333,6 +347,7 @@ Panel {
             Repeater {
               model: root.firing
               Text {
+                textFormat: Text.PlainText
                 width: column.width
                 text: "\uf071  " + modelData.system + " — " + (modelData.types || []).join(", ")
                 color: root.alertColor
@@ -346,6 +361,7 @@ Panel {
           PanelSeparator { width: parent.width; foreground: root.foreground }
 
           Text {
+            textFormat: Text.PlainText
             width: parent.width
             text: root.hubUrl !== "" ? "right-click the icon for the dashboard · r refreshes"
                                      : "r refreshes"
@@ -375,6 +391,7 @@ Panel {
       implicitHeight: Math.max(nameText.implicitHeight, statusText.implicitHeight)
 
       Text {
+        textFormat: Text.PlainText
         id: nameText
         text: card.server ? card.server.name : ""
         color: root.foreground
@@ -389,6 +406,7 @@ Panel {
       }
 
       Text {
+        textFormat: Text.PlainText
         id: statusText
         text: card.server ? String(card.server.status).toUpperCase() : ""
         color: card.down ? root.alertColor : root.dim
@@ -401,6 +419,7 @@ Panel {
     }
 
     Text {
+      textFormat: Text.PlainText
       width: parent.width
       visible: !!card.server && String(card.server.label) !== ""
       text: card.server ? card.server.label : ""
@@ -417,6 +436,7 @@ Panel {
     MetricRow { width: parent.width; label: "DISK"; value: card.server ? card.server.disk : 0; down: card.down }
 
     Text {
+      textFormat: Text.PlainText
       width: parent.width
       text: {
         if (!card.server) return ""
@@ -443,6 +463,7 @@ Panel {
     implicitHeight: Math.max(rowLabel.implicitHeight, rowValue.implicitHeight)
 
     Text {
+      textFormat: Text.PlainText
       id: rowLabel
       text: metricRow.label
       color: root.dim
@@ -487,6 +508,7 @@ Panel {
     }
 
     Text {
+      textFormat: Text.PlainText
       id: rowValue
       text: metricRow.down ? "—" : Math.round(metricRow.value) + "%"
       color: metricRow.down ? root.dim : root.foreground
