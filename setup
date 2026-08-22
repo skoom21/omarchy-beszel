@@ -1,0 +1,93 @@
+#!/usr/bin/env bash
+# One-time setup for the Omarchy Beszel widget.
+#
+# Prompts for your hub URL, email, and password, verifies them against the hub,
+# and writes them to a 0600 credentials file so the password never has to go
+# into shell.json. Re-run any time to change them.
+
+set -uo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+HELPER="$HERE/bin/beszel-status"
+CONFIG="${BESZEL_CONFIG:-$HOME/.config/beszel-status/config}"
+
+bold() { printf '\033[1m%s\033[0m\n' "$*"; }
+warn() { printf '\033[33m%s\033[0m\n' "$*"; }
+err()  { printf '\033[31m%s\033[0m\n' "$*" >&2; }
+ok()   { printf '\033[32m%s\033[0m\n' "$*"; }
+
+command -v python3 >/dev/null 2>&1 || {
+  err "python3 is required but was not found on PATH."
+  exit 1
+}
+[[ -r $HELPER ]] || { err "helper not found: $HELPER"; exit 1; }
+
+bold "Omarchy Beszel widget — setup"
+echo
+
+existing_url="" existing_email=""
+if [[ -r $CONFIG ]]; then
+  warn "Existing config found at $CONFIG — press Enter to keep a value."
+  existing_url=$(sed -n 's/^url=//p'   "$CONFIG" | head -1)
+  existing_email=$(sed -n 's/^email=//p' "$CONFIG" | head -1)
+  echo
+fi
+
+default_url="${existing_url:-http://localhost:8090}"
+read -r -p "Beszel hub URL [$default_url]: " url
+url="${url:-$default_url}"
+
+if [[ -n $existing_email ]]; then
+  read -r -p "Hub email [$existing_email]: " email
+  email="${email:-$existing_email}"
+else
+  read -r -p "Hub email: " email
+fi
+[[ -n $email ]] || { err "email is required"; exit 1; }
+
+# -s so the password is never echoed to the terminal or its scrollback.
+read -r -s -p "Hub password: " password; echo
+[[ -n $password ]] || { err "password is required"; exit 1; }
+
+echo
+echo "Verifying…"
+# Pass secrets through the environment, never argv, so they stay out of `ps`.
+if ! result=$(BESZEL_URL="$url" BESZEL_EMAIL="$email" BESZEL_PASSWORD="$password" \
+              BESZEL_CONFIG=/dev/null python3 "$HELPER" --check 2>&1); then
+  err "  $result"
+  echo
+  err "Nothing was written. Check the URL and credentials and try again."
+  echo "Note: this is a regular Beszel *user* account, not a PocketBase superuser."
+  exit 1
+fi
+ok "  $result"
+
+mkdir -p "$(dirname "$CONFIG")"
+chmod 700 "$(dirname "$CONFIG")" 2>/dev/null
+
+# Preserve any label.* lines the user added by hand.
+labels=""
+[[ -r $CONFIG ]] && labels=$(grep '^label\.' "$CONFIG" 2>/dev/null)
+
+umask 077
+{
+  echo "# Credentials for the Omarchy Beszel widget. Keep this file private."
+  echo "url=$url"
+  echo "email=$email"
+  echo "password=$password"
+  echo
+  echo "# Optional: a subtitle shown under a server's name in the panel."
+  echo "# The key must match the system name as it appears in Beszel."
+  echo "# label.my-server=Hetzner · 10.0.0.1"
+  [[ -n $labels ]] && printf '%s\n' "$labels"
+} >"$CONFIG"
+chmod 600 "$CONFIG"
+
+echo
+ok "Wrote $CONFIG (0600)"
+echo
+bold "Next:"
+echo "  omarchy plugin enable skoom.beszel --section right"
+echo
+echo "Already enabled? The widget picks this up within a poll interval, or"
+echo "force it now with:  omarchy-shell skoom.beszel refresh"

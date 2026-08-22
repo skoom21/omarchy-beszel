@@ -1,0 +1,326 @@
+#!/usr/bin/env python3
+"""Emit a one-line JSON summary of a Beszel hub for the Omarchy bar widget.
+
+Configuration is resolved per key, environment first, then the credentials
+file, so a user can put the hub URL in the plugin settings while keeping the
+password out of shell.json:
+
+  BESZEL_URL / BESZEL_EMAIL / BESZEL_PASSWORD   passed by the panel
+  $BESZEL_CONFIG or ~/.config/beszel-status/config   key=value, mode 0600
+
+Always exits 0 and always prints valid JSON, so the bar never has to parse
+failure. Use --check for a human-readable exit-code test instead.
+
+Stdlib only, so it runs anywhere Omarchy does.
+"""
+import hashlib
+import json
+import os
+import sys
+import urllib.error
+import urllib.request
+
+DEFAULT_CONFIG = os.path.expanduser("~/.config/beszel-status/config")
+THEME_COLORS = os.path.expanduser(
+    "~/.local/state/omarchy/current/theme/colors.toml")
+CACHE_DIR = os.path.join(
+    os.environ.get("XDG_CACHE_HOME", os.path.expanduser("~/.cache")),
+    "omarchy-beszel")
+TIMEOUT = 5
+FALLBACK_RED = "#de6145"
+
+
+# --------------------------------------------------------------- theme colour
+
+def _lum(hexstr):
+    h = str(hexstr).lstrip("#")
+    if len(h) != 6:
+        return None
+    try:
+        r, g, b = (int(h[i:i + 2], 16) / 255 for i in (0, 2, 4))
+    except ValueError:
+        return None
+    f = lambda c: c / 12.92 if c <= 0.04045 else ((c + 0.055) / 1.055) ** 2.4
+    return 0.2126 * f(r) + 0.7152 * f(g) + 0.0722 * f(b)
+
+
+def _contrast(a, b):
+    la, lb = _lum(a), _lum(b)
+    if la is None or lb is None:
+        return 0
+    hi, lo = max(la, lb), min(la, lb)
+    return (hi + 0.05) / (lo + 0.05)
+
+
+def alert_color():
+    """The active Omarchy theme's most legible red against the bar background.
+
+    Omarchy maps the shell's `urgent` role from the theme's plain `red`, which
+    in some themes is a near-grey that reads as "disabled" rather than "alert".
+    And `bright_red` is an ANSI slot name, not a luminance promise -- some
+    themes make it the darker of the two. So read the candidates plus the
+    background and keep whichever actually contrasts. Re-read every poll so the
+    colour follows theme changes without a restart.
+    """
+    keys = {}
+    try:
+        with open(THEME_COLORS) as fh:
+            for line in fh:
+                line = line.strip()
+                if "=" not in line or line.startswith("#"):
+                    continue
+                k, v = line.split("=", 1)
+                k, v = k.strip(), v.strip().strip("\"'")
+                if k in ("red", "bright_red", "orange", "background"):
+                    keys.setdefault(k, v)
+    except OSError:
+        return FALLBACK_RED
+
+    bg = keys.get("background", "#121212")
+    candidates = [keys[k] for k in ("red", "bright_red", "orange") if k in keys]
+    if not candidates:
+        return FALLBACK_RED
+    best = max(candidates, key=lambda c: _contrast(c, bg))
+    return best if _contrast(best, bg) >= 3.0 else FALLBACK_RED
+
+
+# -------------------------------------------------------------- configuration
+
+def read_config_file(path):
+    cfg = {}
+    try:
+        with open(path) as fh:
+            for line in fh:
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    k, v = line.split("=", 1)
+                    cfg[k.strip()] = v.strip()
+    except OSError:
+        pass
+    return cfg
+
+
+def resolve_config():
+    path = os.environ.get("BESZEL_CONFIG") or DEFAULT_CONFIG
+    cfg = read_config_file(os.path.expanduser(path))
+    # Plugin settings win per key, so the URL can live in shell.json while the
+    # password stays in the 0600 file.
+    for env_key, cfg_key in (("BESZEL_URL", "url"),
+                             ("BESZEL_EMAIL", "email"),
+                             ("BESZEL_PASSWORD", "password")):
+        value = os.environ.get(env_key, "").strip()
+        if value:
+            cfg[cfg_key] = value
+    cfg.setdefault("url", "http://localhost:8090")
+    cfg["_configPath"] = os.path.expanduser(path)
+    return cfg
+
+
+def missing_fields(cfg):
+    return [k for k in ("url", "email", "password") if not cfg.get(k)]
+
+
+# ------------------------------------------------------------------- hub calls
+
+def cache_path(cfg):
+    key = hashlib.sha256(
+        f"{cfg.get('url','')}|{cfg.get('email','')}".encode()).hexdigest()[:16]
+    return os.path.join(CACHE_DIR, f"token-{key}")
+
+
+def call(base, path, token=None, data=None):
+    headers = {"Content-Type": "application/json"}
+    if token:
+        headers["Authorization"] = token
+    req = urllib.request.Request(
+        base.rstrip("/") + path,
+        headers=headers,
+        data=json.dumps(data).encode() if data else None,
+        method="POST" if data else "GET",
+    )
+    with urllib.request.urlopen(req, timeout=TIMEOUT) as r:
+        return json.load(r)
+
+
+def authenticate(cfg):
+    res = call(cfg["url"], "/api/collections/users/auth-with-password",
+               data={"identity": cfg["email"], "password": cfg["password"]})
+    token = res["token"]
+    try:
+        os.makedirs(CACHE_DIR, exist_ok=True)
+        fd = os.open(cache_path(cfg), os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
+        with open(fd, "w") as fh:
+            fh.write(token)
+    except OSError:
+        pass  # A cache we cannot write just means re-authenticating each poll.
+    return token
+
+
+def fetch(cfg):
+    """Try the cached token first; re-authenticate once if it has expired."""
+    token = None
+    try:
+        with open(cache_path(cfg)) as fh:
+            token = fh.read().strip()
+    except OSError:
+        pass
+
+    for attempt in (0, 1):
+        if not token:
+            token = authenticate(cfg)
+        try:
+            systems = call(cfg["url"],
+                           "/api/collections/systems/records?perPage=200",
+                           token)["items"]
+            alerts = call(
+                cfg["url"],
+                "/api/collections/alerts/records?perPage=200&filter=(triggered=true)",
+                token)["items"]
+            return systems, alerts
+        except urllib.error.HTTPError as e:
+            if e.code in (401, 403) and attempt == 0:
+                token = None
+                continue
+            raise
+    raise RuntimeError("unreachable")
+
+
+# ----------------------------------------------------------------- formatting
+
+def fmt_uptime(secs):
+    try:
+        secs = int(secs)
+    except (TypeError, ValueError):
+        return ""
+    d, rem = divmod(secs, 86400)
+    h, rem = divmod(rem, 3600)
+    m = rem // 60
+    if d:
+        return f"{d}d {h}h"
+    if h:
+        return f"{h}h {m}m"
+    return f"{m}m"
+
+
+def friendly_error(e):
+    if isinstance(e, urllib.error.HTTPError):
+        if e.code in (400, 401, 403):
+            return "Hub rejected those credentials"
+        return f"Hub returned HTTP {e.code}"
+    if isinstance(e, urllib.error.URLError):
+        return f"Cannot reach hub ({e.reason})"
+    return str(e) or e.__class__.__name__
+
+
+def emit(payload):
+    print(json.dumps(payload))
+
+
+def base_payload(cfg, **extra):
+    payload = {
+        "configured": False, "ok": False,
+        "up": 0, "total": 0, "alerts": 0,
+        "label": "—", "badge": "", "summary": "",
+        "alertColor": alert_color(),
+        "hubUrl": cfg.get("url", ""),
+        "configPath": cfg.get("_configPath", DEFAULT_CONFIG),
+        "systems": [], "firing": [], "error": "",
+    }
+    payload.update(extra)
+    return payload
+
+
+# ----------------------------------------------------------------------- main
+
+def build(cfg):
+    systems, alerts = fetch(cfg)
+
+    total = len(systems)
+    up = sum(1 for s in systems if s.get("status") == "up")
+    firing_by_system = {}
+    for a in alerts:
+        firing_by_system.setdefault(a.get("system"), []).append(a.get("name", "?"))
+    firing = len(alerts)
+
+    rows = []
+    for s in sorted(systems, key=lambda x: str(x.get("name", ""))):
+        info = s.get("info") or {}
+        name = s.get("name", "?")
+        la = info.get("la") or []
+        rows.append({
+            "name": name,
+            "status": s.get("status", "?"),
+            "label": cfg.get(f"label.{name}", ""),
+            "cpu": round(float(info.get("cpu") or 0), 1),
+            "mem": round(float(info.get("mp") or 0), 1),
+            "disk": round(float(info.get("dp") or 0), 1),
+            "cores": info.get("t") or 0,
+            "load": "  ".join(f"{float(x):.2f}" for x in la) if la else "",
+            "uptime": fmt_uptime(info.get("u")),
+            "agent": info.get("v") or "",
+            "firing": sorted(firing_by_system.get(s.get("id"), [])),
+        })
+
+    # `badge` sits in the hero's fixed-width pill next to the title, so it has
+    # to stay short -- a long string there elides the title itself down to "...".
+    # `summary` carries the full sentence for the tooltip and problem section.
+    if total == 0:
+        badge = summary = "No systems"
+    elif up == total and firing == 0:
+        badge = summary = "All healthy"
+    elif firing:
+        badge = f"{firing} alert{'s' if firing != 1 else ''}"
+        summary = f"{firing} alert{'s' if firing != 1 else ''} firing"
+    else:
+        badge = summary = f"{total - up} down"
+
+    return base_payload(
+        cfg,
+        configured=True,
+        ok=(total > 0 and up == total and firing == 0),
+        up=up, total=total, alerts=firing,
+        label=f"{up}/{total}" if not firing else f"{up}/{total} !{firing}",
+        badge=badge,
+        summary=summary,
+        systems=rows,
+        firing=[{"system": r["name"], "types": r["firing"]}
+                for r in rows if r["firing"]],
+    )
+
+
+def main():
+    check = "--check" in sys.argv[1:]
+    cfg = resolve_config()
+
+    missing = missing_fields(cfg)
+    if missing:
+        message = "Not configured — missing " + ", ".join(missing)
+        if check:
+            print(message, file=sys.stderr)
+            return 1
+        emit(base_payload(cfg, label="setup", badge="Setup needed",
+                          summary=message, error="unconfigured"))
+        return 0
+
+    try:
+        payload = build(cfg)
+    except Exception as e:  # noqa: BLE001 - any failure must still render
+        message = friendly_error(e)
+        if check:
+            print(message, file=sys.stderr)
+            return 1
+        badge = ("Auth failed" if "credentials" in message
+                 else "Unreachable" if "reach" in message else "Error")
+        emit(base_payload(cfg, configured=True, label="!", badge=badge,
+                          summary=message, error=message))
+        return 0
+
+    if check:
+        print(f"Connected to {cfg['url']} — {payload['up']}/{payload['total']} up")
+        return 0
+    emit(payload)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

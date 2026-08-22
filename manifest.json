@@ -1,0 +1,83 @@
+{
+  "schemaVersion": 1,
+  "id": "skoom.beszel",
+  "name": "Beszel servers",
+  "version": "1.0.0",
+  "author": "skoom",
+  "license": "MIT",
+  "homepage": "https://github.com/skoom21/omarchy-beszel",
+  "description": "Server health from a Beszel hub: one bar icon that turns urgent when a server drops or an alert fires, and one panel with per-server CPU, memory, and disk meters.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "activation": "on-demand",
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Beszel servers",
+    "description": "Up-count in the bar; click for per-server meters, load, uptime, and firing alerts.",
+    "category": "System",
+    "aliases": ["beszel", "servers"],
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "hubUrl": "",
+      "email": "",
+      "password": "",
+      "credentialsFile": "",
+      "refreshIntervalSec": 30,
+      "openRefreshIntervalSec": 5
+    },
+    "schema": [
+      {
+        "key": "hubUrl",
+        "type": "string",
+        "label": "Hub URL",
+        "defaultValue": "",
+        "description": "Your Beszel hub, e.g. http://localhost:8090. Leave blank to use the credentials file."
+      },
+      {
+        "key": "email",
+        "type": "string",
+        "label": "Hub email",
+        "defaultValue": "",
+        "description": "The Beszel user account to read from. Leave blank to use the credentials file."
+      },
+      {
+        "key": "password",
+        "type": "string",
+        "label": "Hub password (stored in plain text)",
+        "defaultValue": "",
+        "description": "Convenient but readable by anything that can read shell.json. To keep it out of shell.json, leave this blank and run the plugin's ./setup script instead."
+      },
+      {
+        "key": "credentialsFile",
+        "type": "path",
+        "label": "Credentials file",
+        "defaultValue": "",
+        "description": "Override the default ~/.config/beszel-status/config. Values set above win over this file, per field."
+      },
+      {
+        "key": "refreshIntervalSec",
+        "type": "integer",
+        "label": "Refresh interval (seconds)",
+        "min": 5,
+        "max": 600,
+        "step": 5,
+        "defaultValue": 30,
+        "description": "How often the bar icon re-checks the hub while the panel is closed."
+      },
+      {
+        "key": "openRefreshIntervalSec",
+        "type": "integer",
+        "label": "Refresh interval while open (seconds)",
+        "min": 1,
+        "max": 60,
+        "step": 1,
+        "defaultValue": 5,
+        "description": "Faster cadence while the panel is on screen so the meters move as you watch."
+      }
+    ]
+  }
+}
