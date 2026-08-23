@@ -34,6 +34,11 @@ CACHE_DIR = os.path.join(
     "omarchy-beszel")
 TIMEOUT = 5
 MAX_BYTES = 4 * 1024 * 1024
+# The hub is untrusted input, so every value taken from it is bounded: one
+# hostile field must not be able to blank the panel or bloat the payload.
+MAX_SYSTEMS = 200
+MAX_TEXT = 200
+MAX_LOADS = 3
 MAX_FILE_BYTES = 256 * 1024
 STDIN_WAIT = 2.0
 FALLBACK_RED = "#de6145"
@@ -52,7 +57,76 @@ class _NoRedirects(urllib.request.HTTPRedirectHandler):
         raise urllib.error.URLError(f"refused redirect to {newurl}")
 
 
-_OPENER = urllib.request.build_opener(_NoRedirects)
+def _http_only_opener():
+    """An opener that speaks only HTTP(S).
+
+    urllib's default opener also carries FileHandler, FTPHandler and
+    DataHandler, so an unvalidated hub URL could be pointed at file:// or
+    ftp:// and make the helper read local files or open outbound FTP
+    connections. Build the chain explicitly instead; an unknown scheme then
+    fails cleanly rather than being served by a handler nobody intended.
+    """
+    opener = urllib.request.OpenerDirector()
+    for handler in (
+        urllib.request.HTTPHandler(),
+        urllib.request.HTTPSHandler(),
+        urllib.request.HTTPDefaultErrorHandler(),
+        urllib.request.HTTPErrorProcessor(),
+        _NoRedirects(),
+    ):
+        opener.add_handler(handler)
+    return opener
+
+
+_OPENER = _http_only_opener()
+
+
+def http_url_error(url):
+    """Why this URL is unusable as a hub address, or None if it is fine."""
+    text = str(url or "")
+    if not text:
+        return "No hub URL configured"
+    scheme = text.split("://", 1)[0].lower() if "://" in text else ""
+    if scheme not in ("http", "https"):
+        return "Hub URL must start with http:// or https://"
+    if not text.split("://", 1)[1].strip():
+        return "Hub URL has no host"
+    return None
+
+
+def _open_private(path, flags, mode=0o600, dir_fd=None):
+    """Open a path we expect to own, refusing anything that is not our file.
+
+    Three separate hazards at a predictable path, all closed here:
+
+    - O_NOFOLLOW stops a symlink redirecting the open somewhere else.
+    - O_NONBLOCK stops a FIFO hanging the process: O_NOFOLLOW does not refuse a
+      named pipe, and a blocking open of one waits forever for a writer. With
+      O_NONBLOCK the open returns immediately and the fstat below rejects it.
+      This matters most on the polling path, where a hung helper would pile up
+      a stuck process on every refresh.
+    - The fstat refuses anything that is not a regular file owned by this user,
+      checked on the descriptor rather than the path so there is no TOCTOU gap.
+
+    O_NONBLOCK has no effect on reads from a regular file, so it is safe to
+    leave set once the descriptor is known to be one.
+    """
+    fd = os.open(
+        path,
+        flags | os.O_NOFOLLOW | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0),
+        mode,
+        dir_fd=dir_fd,
+    )
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise PermissionError(f"not a regular file: {path}")
+        if st.st_uid != os.getuid():
+            raise PermissionError(f"not owned by this user: {path}")
+    except Exception:
+        os.close(fd)
+        raise
+    return fd
 
 
 # --------------------------------------------------------------- theme colour
@@ -89,17 +163,25 @@ def alert_color():
     """
     keys = {}
     try:
-        with open(THEME_COLORS) as fh:
-            for line in fh:
-                line = line.strip()
-                if "=" not in line or line.startswith("#"):
-                    continue
-                k, v = line.split("=", 1)
-                k, v = k.strip(), v.strip().strip("\"'")
-                if k in ("red", "bright_red", "orange", "background"):
-                    keys.setdefault(k, v)
+        # Read through the same hardened opener as the credentials file. This
+        # path is just as predictable, and it is read on every poll, so a FIFO
+        # planted here would hang a helper per refresh. O_NOFOLLOW applies only
+        # to the final component, so Omarchy's `current` theme symlink higher up
+        # the path still resolves normally.
+        fd = _open_private(THEME_COLORS, os.O_RDONLY)
+        with os.fdopen(fd, "r", errors="replace") as fh:
+            blob = fh.read(MAX_FILE_BYTES)
     except OSError:
         return FALLBACK_RED
+
+    for line in blob.splitlines():
+        line = line.strip()
+        if "=" not in line or line.startswith("#"):
+            continue
+        k, v = line.split("=", 1)
+        k, v = k.strip(), v.strip().strip("\"'")
+        if k in ("red", "bright_red", "orange", "background"):
+            keys.setdefault(k, v)
 
     bg = keys.get("background", "#121212")
     candidates = [keys[k] for k in ("red", "bright_red", "orange") if k in keys]
@@ -110,41 +192,6 @@ def alert_color():
 
 
 # -------------------------------------------------------------- configuration
-
-def _open_private(path, flags, mode=0o600, dir_fd=None):
-    """Open a path we expect to own, refusing anything that is not our file.
-
-    Three separate hazards at a predictable path, all closed here:
-
-    - O_NOFOLLOW stops a symlink redirecting the open somewhere else.
-    - O_NONBLOCK stops a FIFO hanging the process: O_NOFOLLOW does not refuse a
-      named pipe, and a blocking open of one waits forever for a writer. With
-      O_NONBLOCK the open returns immediately and the fstat below rejects it.
-      This matters most on the polling path, where a hung helper would pile up
-      a stuck process on every refresh.
-    - The fstat refuses anything that is not a regular file owned by this user,
-      checked on the descriptor rather than the path so there is no TOCTOU gap.
-
-    O_NONBLOCK has no effect on reads from a regular file, so it is safe to
-    leave set once the descriptor is known to be one.
-    """
-    fd = os.open(
-        path,
-        flags | os.O_NOFOLLOW | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0),
-        mode,
-        dir_fd=dir_fd,
-    )
-    try:
-        st = os.fstat(fd)
-        if not stat.S_ISREG(st.st_mode):
-            raise PermissionError(f"not a regular file: {path}")
-        if st.st_uid != os.getuid():
-            raise PermissionError(f"not owned by this user: {path}")
-    except Exception:
-        os.close(fd)
-        raise
-    return fd
-
 
 def read_config_file(path):
     """Parse a key=value credentials file, bounded and symlink-safe."""
@@ -324,6 +371,9 @@ def cache_path(cfg):
 
 
 def call(base, path, token=None, data=None):
+    problem = http_url_error(base)
+    if problem:
+        raise ValueError(problem)
     headers = {"Content-Type": "application/json"}
     if token:
         headers["Authorization"] = token
@@ -398,6 +448,27 @@ def fetch(cfg, force_auth=False):
 
 # ----------------------------------------------------------------- formatting
 
+def hub_number(value, default=0.0):
+    """A finite float from hub data, or the default.
+
+    Coerced per field on purpose. A single non-numeric value used to raise out
+    of build() and turn the whole panel into "Hub returned an unexpected
+    response", losing every healthy row alongside the bad one.
+    """
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return default
+    return number if number == number and abs(number) != float("inf") else default
+
+
+def hub_text(value, limit=MAX_TEXT):
+    """A length-bounded string from hub data."""
+    if value is None:
+        return ""
+    return str(value)[:limit]
+
+
 def fmt_uptime(secs):
     try:
         secs = int(secs)
@@ -448,6 +519,11 @@ def base_payload(cfg, **extra):
 def build(cfg, force_auth=False):
     systems, alerts = fetch(cfg, force_auth=force_auth)
 
+    if not isinstance(systems, list):
+        raise ValueError("hub returned a malformed systems list")
+    systems = [s for s in systems if isinstance(s, dict)]
+    alerts = [a for a in alerts if isinstance(a, dict)] if isinstance(alerts, list) else []
+
     total = len(systems)
     up = sum(1 for s in systems if s.get("status") == "up")
     firing_by_system = {}
@@ -456,22 +532,26 @@ def build(cfg, force_auth=False):
     firing = len(alerts)
 
     rows = []
-    for s in sorted(systems, key=lambda x: str(x.get("name", ""))):
-        info = s.get("info") or {}
-        name = s.get("name", "?")
-        la = info.get("la") or []
+    for s in sorted(systems[:MAX_SYSTEMS], key=lambda x: hub_text(x.get("name"))):
+        info = s.get("info") if isinstance(s.get("info"), dict) else {}
+        name = hub_text(s.get("name")) or "?"
+        # Load averages are 1/5/15 minute figures; anything longer is not real
+        # data, and joining an unbounded list would render a huge string.
+        raw_loads = info.get("la")
+        loads = raw_loads[:MAX_LOADS] if isinstance(raw_loads, list) else []
         rows.append({
             "name": name,
-            "status": s.get("status", "?"),
+            "status": hub_text(s.get("status"), 32) or "?",
             "label": cfg.get(f"label.{name}", ""),
-            "cpu": round(float(info.get("cpu") or 0), 1),
-            "mem": round(float(info.get("mp") or 0), 1),
-            "disk": round(float(info.get("dp") or 0), 1),
-            "cores": info.get("t") or 0,
-            "load": "  ".join(f"{float(x):.2f}" for x in la) if la else "",
+            "cpu": round(hub_number(info.get("cpu")), 1),
+            "mem": round(hub_number(info.get("mp")), 1),
+            "disk": round(hub_number(info.get("dp")), 1),
+            "cores": int(hub_number(info.get("t"))),
+            "load": "  ".join(f"{hub_number(x):.2f}" for x in loads),
             "uptime": fmt_uptime(info.get("u")),
-            "agent": info.get("v") or "",
-            "firing": sorted(firing_by_system.get(s.get("id"), [])),
+            "agent": hub_text(info.get("v"), 32),
+            "firing": sorted(hub_text(t, 32) for t in
+                             firing_by_system.get(s.get("id"), [])),
         })
 
     # `badge` sits in the hero's fixed-width pill next to the title, so it has
@@ -506,6 +586,15 @@ def main():
     check = "--check" in args
     write = "--write-config" in args
     cfg = resolve_config()
+
+    scheme_problem = http_url_error(cfg.get("url"))
+    if scheme_problem and not missing_fields(cfg):
+        if check or write:
+            print(scheme_problem, file=sys.stderr)
+            return 1
+        emit(base_payload(cfg, configured=True, label="!", badge="Bad URL",
+                          summary=scheme_problem, error=scheme_problem))
+        return 0
 
     missing = missing_fields(cfg)
     if missing:

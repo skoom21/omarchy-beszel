@@ -30,11 +30,23 @@ Panel {
 
   // Declared in manifest.barWidget.schema, so these are editable from the
   // plugin settings UI rather than only by editing files.
-  readonly property int refreshSec: Math.max(5, Number(setting("refreshIntervalSec", 30)))
-  readonly property int openRefreshSec: Math.max(1, Number(setting("openRefreshIntervalSec", 5)))
+  // Number("abc") is NaN and Math.max(5, NaN) is NaN, which would leave the
+  // Timer with a NaN interval; fall back to the declared default instead.
+  function settingInt(key, fallback, floor) {
+    var value = Number(setting(key, fallback))
+    if (!isFinite(value)) value = Number(fallback)
+    return Math.max(floor, Math.round(value))
+  }
+
+  readonly property int refreshSec: root.settingInt("refreshIntervalSec", 30, 5)
+  readonly property int openRefreshSec: root.settingInt("openRefreshIntervalSec", 5, 1)
 
   // Resolved against this file, so the plugin works from wherever it is cloned.
-  readonly property string pluginDir: String(Qt.resolvedUrl(".")).replace(/^file:\/\//, "").replace(/\/$/, "")
+  // decodeURIComponent matters: Qt.resolvedUrl percent-encodes, so a plugin
+  // installed under a path containing a space or a bracket would otherwise
+  // hand the Process a literal "%20" and fail to start the helper at all.
+  readonly property string pluginDir: decodeURIComponent(
+    String(Qt.resolvedUrl(".")).replace(/^file:\/\//, "").replace(/\/$/, ""))
   readonly property string helperPath: root.pluginDir + "/bin/beszel-status"
 
   // Sensitive details are hidden by default so a screenshot, a screen share, or
