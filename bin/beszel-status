@@ -111,15 +111,29 @@ def alert_color():
 
 # -------------------------------------------------------------- configuration
 
-def _open_private(path, flags, mode=0o600):
-    """Open a path we expect to own, refusing symlinks and foreign files.
+def _open_private(path, flags, mode=0o600, dir_fd=None):
+    """Open a path we expect to own, refusing anything that is not our file.
 
-    O_NOFOLLOW stops a symlink planted at a predictable path from redirecting a
-    read or a token write somewhere else, and the fstat check refuses anything
-    that is not a regular file we own -- both verified after the fd exists, so
-    there is no TOCTOU gap between the check and the use.
+    Three separate hazards at a predictable path, all closed here:
+
+    - O_NOFOLLOW stops a symlink redirecting the open somewhere else.
+    - O_NONBLOCK stops a FIFO hanging the process: O_NOFOLLOW does not refuse a
+      named pipe, and a blocking open of one waits forever for a writer. With
+      O_NONBLOCK the open returns immediately and the fstat below rejects it.
+      This matters most on the polling path, where a hung helper would pile up
+      a stuck process on every refresh.
+    - The fstat refuses anything that is not a regular file owned by this user,
+      checked on the descriptor rather than the path so there is no TOCTOU gap.
+
+    O_NONBLOCK has no effect on reads from a regular file, so it is safe to
+    leave set once the descriptor is known to be one.
     """
-    fd = os.open(path, flags | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0), mode)
+    fd = os.open(
+        path,
+        flags | os.O_NOFOLLOW | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0),
+        mode,
+        dir_fd=dir_fd,
+    )
     try:
         st = os.fstat(fd)
         if not stat.S_ISREG(st.st_mode):
@@ -217,7 +231,6 @@ def write_config(path, values):
     """
     parent = os.path.dirname(path) or "."
     name = os.path.basename(path)
-    cloexec = getattr(os, "O_CLOEXEC", 0)
 
     dfd = _open_dir_private(parent, create=True)
     try:
@@ -225,7 +238,7 @@ def write_config(path, values):
         # non-destructive, so a check-after-open is sufficient here.
         labels = []
         try:
-            rfd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | cloexec, dir_fd=dfd)
+            rfd = _open_private(name, os.O_RDONLY, dir_fd=dfd)
             with os.fdopen(rfd, "r", errors="replace") as fh:
                 for line in fh.read(MAX_FILE_BYTES).splitlines():
                     if line.strip().startswith("label."):
