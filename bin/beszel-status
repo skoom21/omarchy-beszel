@@ -153,6 +153,58 @@ def read_config_file(path):
     return cfg
 
 
+def _open_dir_private(path, create=False):
+    """Open a directory we own, refusing symlinks."""
+    cloexec = getattr(os, "O_CLOEXEC", 0)
+    if create:
+        try:
+            os.mkdir(path, 0o700)
+        except FileExistsError:
+            pass
+    dfd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | cloexec)
+    try:
+        st = os.fstat(dfd)
+        if not stat.S_ISDIR(st.st_mode):
+            raise PermissionError(f"not a directory: {path}")
+        if st.st_uid != os.getuid():
+            raise PermissionError(f"not owned by this user: {path}")
+        os.fchmod(dfd, 0o700)
+    except Exception:
+        os.close(dfd)
+        raise
+    return dfd
+
+
+def _atomic_write_private(dfd, name, content):
+    """Replace `name` under `dfd` atomically, never truncating the destination.
+
+    O_NOFOLLOW refuses a symlink but not a same-owner *hard link*, and opening
+    the destination O_TRUNC would already have destroyed whatever that link
+    points at before any fstat could reject it. So the destination is never
+    opened for writing: a fresh O_EXCL temporary is created under the verified
+    directory descriptor -- O_EXCL guarantees a brand-new inode with no
+    pre-existing links -- and renamed into place, which is atomic, so a reader
+    sees either the old file or the complete new one and never a partial write.
+    """
+    cloexec = getattr(os, "O_CLOEXEC", 0)
+    tmp = f".{name}.{os.getpid()}.{os.urandom(6).hex()}.tmp"
+    fd = os.open(tmp, os.O_CREAT | os.O_EXCL | os.O_WRONLY | cloexec, 0o600,
+                 dir_fd=dfd)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w") as fh:
+            fh.write(content)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.rename(tmp, name, src_dir_fd=dfd, dst_dir_fd=dfd)
+    except Exception:
+        try:
+            os.unlink(tmp, dir_fd=dfd)
+        except OSError:
+            pass
+        raise
+
+
 def write_config(path, values):
     """Write the credentials file without ever following a symlink.
 
@@ -167,22 +219,10 @@ def write_config(path, values):
     name = os.path.basename(path)
     cloexec = getattr(os, "O_CLOEXEC", 0)
 
-    # Create the parent only when it is genuinely missing; never through a link.
+    dfd = _open_dir_private(parent, create=True)
     try:
-        os.mkdir(parent, 0o700)
-    except FileExistsError:
-        pass
-
-    dfd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | cloexec)
-    try:
-        dst = os.fstat(dfd)
-        if not stat.S_ISDIR(dst.st_mode):
-            raise PermissionError(f"not a directory: {parent}")
-        if dst.st_uid != os.getuid():
-            raise PermissionError(f"not owned by this user: {parent}")
-        os.fchmod(dfd, 0o700)
-
-        # Keep any label.* lines the user added by hand.
+        # Keep any label.* lines the user added by hand. Reading is
+        # non-destructive, so a check-after-open is sufficient here.
         labels = []
         try:
             rfd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | cloexec, dir_fd=dfd)
@@ -193,31 +233,17 @@ def write_config(path, values):
         except OSError:
             pass
 
-        fd = os.open(name,
-                     os.O_CREAT | os.O_WRONLY | os.O_TRUNC | os.O_NOFOLLOW | cloexec,
-                     0o600, dir_fd=dfd)
-        try:
-            fst = os.fstat(fd)
-            if not stat.S_ISREG(fst.st_mode):
-                raise PermissionError(f"not a regular file: {path}")
-            if fst.st_uid != os.getuid():
-                raise PermissionError(f"not owned by this user: {path}")
-            os.fchmod(fd, 0o600)
-            body = [
-                "# Credentials for the Omarchy Beszel widget. Keep this file private.",
-                f"url={values.get('url', '')}",
-                f"email={values.get('email', '')}",
-                f"password={values.get('password', '')}",
-                "",
-                "# Optional: a subtitle shown under a server's name in the panel.",
-                "# The key must match the system name as it appears in Beszel.",
-                "# label.my-server=Hetzner \u00b7 10.0.0.1",
-            ] + labels
-            with os.fdopen(fd, "w") as fh:
-                fh.write("\n".join(body) + "\n")
-        except Exception:
-            os.close(fd)
-            raise
+        body = [
+            "# Credentials for the Omarchy Beszel widget. Keep this file private.",
+            f"url={values.get('url', '')}",
+            f"email={values.get('email', '')}",
+            f"password={values.get('password', '')}",
+            "",
+            "# Optional: a subtitle shown under a server's name in the panel.",
+            "# The key must match the system name as it appears in Beszel.",
+            "# label.my-server=Hetzner \u00b7 10.0.0.1",
+        ] + labels
+        _atomic_write_private(dfd, name, "\n".join(body) + "\n")
     finally:
         os.close(dfd)
 
@@ -306,16 +332,15 @@ def authenticate(cfg):
                data={"identity": cfg["email"], "password": cfg["password"]})
     token = res["token"]
     try:
-        os.makedirs(CACHE_DIR, mode=0o700, exist_ok=True)
-        os.chmod(CACHE_DIR, 0o700)
-        path = cache_path(cfg)
-        # O_NOFOLLOW: the cache path is predictable, so a symlink planted there
-        # must not be able to redirect the session-token write.
-        fd = _open_private(path, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
-        with os.fdopen(fd, "w") as fh:
-            fh.write(token)
-        # O_CREAT does not tighten a file that already exists.
-        os.chmod(path, 0o600)
+        # Same hazard as the credentials file: the cache path is predictable, so
+        # the destination is never opened for writing -- O_TRUNC would destroy
+        # whatever a planted hard link points at before any check could reject
+        # it. A fresh O_EXCL temporary is renamed into place instead.
+        dfd = _open_dir_private(CACHE_DIR, create=True)
+        try:
+            _atomic_write_private(dfd, os.path.basename(cache_path(cfg)), token)
+        finally:
+            os.close(dfd)
     except OSError:
         pass  # A cache we cannot write just means re-authenticating each poll.
     return token
