@@ -17,12 +17,14 @@ failure. Use --check for a human-readable exit-code test instead.
 
 Stdlib only, so it runs anywhere Omarchy does.
 """
+import base64
 import hashlib
 import json
 import os
 import select
 import stat
 import sys
+import time
 import urllib.error
 import urllib.request
 
@@ -370,6 +372,32 @@ def cache_path(cfg):
     return os.path.join(CACHE_DIR, f"token-{key}")
 
 
+def token_stale(token, skew=60):
+    """True when a cached token is expired, near expiry, or unreadable.
+
+    This has to be checked locally because the hub does not reject a stale
+    token with a status code. PocketBase treats an unusable Authorization
+    header as an unauthenticated request, so the list endpoints answer 200
+    with an empty `items` -- the collection rules simply match nothing for an
+    anonymous caller. The 401/403 retry below therefore never fires, and the
+    widget sits on "No systems" indefinitely once the token ages out.
+
+    The payload is untrusted: anything that does not decode into a JWT with a
+    numeric `exp` is treated as stale rather than trusted by default.
+    """
+    parts = str(token).split(".")
+    if len(parts) != 3:
+        return True
+    segment = parts[1]
+    segment += "=" * (-len(segment) % 4)
+    try:
+        claims = json.loads(base64.urlsafe_b64decode(segment.encode()))
+        expiry = float(claims["exp"])
+    except (ValueError, TypeError, KeyError, LookupError):
+        return True
+    return expiry - skew <= time.time()
+
+
 def call(base, path, token=None, data=None):
     problem = http_url_error(base)
     if problem:
@@ -416,6 +444,11 @@ def fetch(cfg, force_auth=False):
     actually exercise the password: the cache is keyed on url+email, so a stale
     entry would otherwise let a wrong password report success and be saved,
     only to fail confusingly once the token expired.
+
+    A cached token is only reused while it is demonstrably still valid, and an
+    empty result from a cached token is retried once with a fresh login. See
+    token_stale() for why an aged-out token cannot be detected from the
+    response status alone.
     """
     token = None
     if not force_auth:
@@ -425,14 +458,26 @@ def fetch(cfg, force_auth=False):
                 token = fh.read(MAX_FILE_BYTES).strip()
         except OSError:
             pass
+        if token and token_stale(token):
+            token = None
 
+    cached = token is not None
     for attempt in (0, 1):
         if not token:
             token = authenticate(cfg)
+            cached = False
         try:
             systems = call(cfg["url"],
                            "/api/collections/systems/records?perPage=200",
                            token)["items"]
+            # An empty list from a cached token is ambiguous: either the hub
+            # really has no systems, or the token was revoked server-side
+            # before its own expiry claim ran out -- a password change or a
+            # token-key rotation both do that. Spending one extra login to
+            # tell them apart beats showing "No systems" forever.
+            if cached and attempt == 0 and not systems:
+                token = None
+                continue
             alerts = call(
                 cfg["url"],
                 "/api/collections/alerts/records?perPage=200&filter=(triggered=true)",
