@@ -1,2 +1,6 @@
 __pycache__/
 *.pyc
+
+# Local working notes, not part of the published plugin
+CLAUDE.md
+ROADMAP.md
